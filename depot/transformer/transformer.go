@@ -2,6 +2,7 @@ package transformer
 
 import (
 	"bytes"
+	"code.cloudfoundry.org/lager/v3"
 	"errors"
 	"fmt"
 	"os"
@@ -19,7 +20,6 @@ import (
 	"code.cloudfoundry.org/executor/depot/steps"
 	"code.cloudfoundry.org/executor/depot/uploader"
 	"code.cloudfoundry.org/garden"
-	"code.cloudfoundry.org/lager/v3"
 	"code.cloudfoundry.org/workpool"
 	"github.com/tedsuo/ifrit"
 )
@@ -63,8 +63,10 @@ type transformer struct {
 	gracefulShutdownInterval    time.Duration
 	healthCheckWorkPool         *workpool.WorkPool
 
-	useContainerProxy bool
-	drainWait         time.Duration
+	useContainerProxy                bool
+	drainWait                        time.Duration
+	enableContainerProxyHealthChecks bool
+	proxyHealthCheckInterval         time.Duration
 
 	postSetupHook []string
 	postSetupUser string
@@ -90,6 +92,13 @@ func WithContainerProxy(drainWait time.Duration) Option {
 	return func(t *transformer) {
 		t.useContainerProxy = true
 		t.drainWait = drainWait
+	}
+}
+
+func WithProxyLivenessChecks(interval time.Duration) Option {
+	return func(t *transformer) {
+		t.enableContainerProxyHealthChecks = true
+		t.proxyHealthCheckInterval = interval
 	}
 }
 
@@ -458,11 +467,13 @@ func (t *transformer) StepsRunner(
 	}
 
 	var proxyStartupChecks []ifrit.Runner
+	var proxyLivenessChecks []ifrit.Runner
 
 	if t.useContainerProxy && t.useDeclarativeHealthCheck {
 		envoyStartupLogger := logger.Session("envoy-startup-check")
+		envoyLivenessLogger := logger.Session("envoy-liveness-check")
 
-		for idx, p := range config.ProxyTLSPorts {
+		for idx, port := range config.ProxyTLSPorts {
 			// add envoy startup checks
 			startupSidecarName := fmt.Sprintf("%s-envoy-startup-healthcheck-%d", gardenContainer.Handle(), idx)
 
@@ -472,7 +483,7 @@ func (t *transformer) StepsRunner(
 				config.BindMounts,
 				"",
 				startupSidecarName,
-				int(p),
+				int(port),
 				DefaultDeclarativeHealthcheckRequestTimeout,
 				executor.TCPCheck,
 				executor.IsStartupCheck,
@@ -482,6 +493,30 @@ func (t *transformer) StepsRunner(
 				config.MetronClient,
 				false,
 			)
+
+			if t.enableContainerProxyHealthChecks {
+				livenessSidecarName := fmt.Sprintf("%s-envoy-liveness-healthcheck-%d", gardenContainer.Handle(), idx)
+
+				livenessStep := t.createCheck(
+					&container,
+					gardenContainer,
+					config.BindMounts,
+					"",
+					livenessSidecarName,
+					int(port),
+					DefaultDeclarativeHealthcheckRequestTimeout,
+					executor.TCPCheck,
+					executor.IsLivenessCheck,
+					t.proxyHealthCheckInterval,
+					envoyLivenessLogger,
+					"instance proxy health check failed",
+					config.MetronClient,
+					t.emitHealthCheckMetrics,
+				)
+
+				proxyLivenessChecks = append(proxyLivenessChecks, livenessStep)
+			}
+
 			proxyStartupChecks = append(proxyStartupChecks, step)
 		}
 	}
@@ -494,8 +529,10 @@ func (t *transformer) StepsRunner(
 				logStreamer,
 				config.BindMounts,
 				proxyStartupChecks,
+				proxyLivenessChecks,
 				config.MetronClient,
 			)
+
 			substeps = append(substeps, monitor)
 		}
 
@@ -821,6 +858,7 @@ func (t *transformer) transformCheckDefinition(
 	logstreamer log_streamer.LogStreamer,
 	bindMounts []garden.BindMount,
 	proxyStartupChecks []ifrit.Runner,
+	proxyLivenessChecks []ifrit.Runner,
 	metronClient loggingclient.IngressClient,
 ) ifrit.Runner {
 	var startupChecks []ifrit.Runner
@@ -930,6 +968,7 @@ func (t *transformer) transformCheckDefinition(
 	}
 
 	startupCheck := steps.NewParallel(append(proxyStartupChecks, startupChecks...))
+	livenessChecks = append(livenessChecks, proxyLivenessChecks...)
 	livenessCheck := steps.NewCodependent(livenessChecks, false, false)
 
 	return steps.NewHealthCheckStep(

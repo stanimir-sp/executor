@@ -102,12 +102,14 @@ type ExecutorConfig struct {
 	DeleteWorkPoolSize                    int                   `json:"delete_work_pool_size,omitempty"`
 	DiskMB                                string                `json:"disk_mb,omitempty"`
 	EnableContainerProxy                  bool                  `json:"enable_container_proxy,omitempty"`
+	EnableContainerProxyHealthChecks      bool                  `json:"enable_container_proxy_healthcheck,omitempty"`
 	EnableDeclarativeHealthcheck          bool                  `json:"enable_declarative_healthcheck,omitempty"`
 	EnableHealtcheckMetrics               bool                  `json:"enable_healthcheck_metrics,omitempty"`
 	EnableUnproxiedPortMappings           bool                  `json:"enable_unproxied_port_mappings"`
 	EnvoyConfigRefreshDelay               durationjson.Duration `json:"envoy_config_refresh_delay"`
 	EnvoyConfigReloadDuration             durationjson.Duration `json:"envoy_config_reload_duration"`
 	EnvoyDrainTimeout                     durationjson.Duration `json:"envoy_drain_timeout,omitempty"`
+	ProxyHealthCheckInterval              durationjson.Duration `json:"proxy_healthcheck_interval,omitempty"`
 	ExportNetworkEnvVars                  bool                  `json:"export_network_env_vars,omitempty"` // DEPRECATED. Kept around for dusts compatability
 	GardenAddr                            string                `json:"garden_addr,omitempty"`
 	GardenHealthcheckCommandRetryPause    durationjson.Duration `json:"garden_healthcheck_command_retry_pause,omitempty"`
@@ -164,6 +166,7 @@ func Initialize(
 	cellID string,
 	zone string,
 	rootFSes map[string]string,
+	sidecarRootFSPath string,
 	metronClient loggingclient.IngressClient,
 	clock clock.Clock,
 ) (
@@ -172,12 +175,7 @@ func Initialize(
 	grouper.Members,
 	error,
 ) {
-
-	var gardenHealthcheckRootFS string
-	for _, rootFSPath := range rootFSes {
-		gardenHealthcheckRootFS = rootFSPath
-		break
-	}
+	logger.Info("garden-healthcheck-rootfs", lager.Data{"rootfs": sidecarRootFSPath})
 
 	postSetupHook, err := shlex.Split(config.PostSetupHook)
 	if err != nil {
@@ -265,9 +263,11 @@ func Initialize(
 		config.PostSetupUser,
 		config.EnableDeclarativeHealthcheck,
 		config.EnableHealtcheckMetrics,
-		gardenHealthcheckRootFS,
+		sidecarRootFSPath,
 		config.EnableContainerProxy,
 		time.Duration(config.EnvoyDrainTimeout),
+		config.EnableContainerProxyHealthChecks,
+		time.Duration(config.ProxyHealthCheckInterval),
 	)
 
 	hub := event.NewHub()
@@ -377,7 +377,7 @@ func Initialize(
 	}
 
 	gardenHealthcheck := gardenhealth.NewChecker(
-		gardenHealthcheckRootFS,
+		sidecarRootFSPath,
 		config.HealthCheckContainerOwnerName,
 		time.Duration(config.GardenHealthcheckCommandRetryPause),
 		healthcheckSpec,
@@ -572,6 +572,8 @@ func initializeTransformer(
 	declarativeHealthcheckRootFS string,
 	enableContainerProxy bool,
 	drainWait time.Duration,
+	enableProxyHealthChecks bool,
+	proxyHealthCheckInterval time.Duration,
 ) transformer.Transformer {
 	var options []transformer.Option
 	compressor := compressor.NewTgz()
@@ -588,6 +590,10 @@ func initializeTransformer(
 
 	if enableContainerProxy {
 		options = append(options, transformer.WithContainerProxy(drainWait))
+
+		if enableProxyHealthChecks {
+			options = append(options, transformer.WithProxyLivenessChecks(proxyHealthCheckInterval))
+		}
 	}
 
 	options = append(options, transformer.WithPostSetupHook(postSetupUser, postSetupHook))
